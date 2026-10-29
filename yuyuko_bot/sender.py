@@ -33,14 +33,17 @@ class OutputSender:
         self._bg_tasks: set[asyncio.Task] = set()
 
     async def send(self, event, hikari_data: Hikari_Model) -> None:
-        """按 `Output.Data` 的实际类型选择发送方式。"""
+        """按 `Output.Data` 的实际类型选择发送方式。
+
+        ▍为什么必须 await 而不是 create_task：
+        AstrBot 的 ProcessStage 在插件 handler 结束后会检查 ``event._has_send_oper``，
+        没发过消息就继续把这条消息交给 LLM。若图片丢进后台任务，handler 返回时
+        ``event.send()`` 还没执行，标志位仍是 False —— 于是 `wws` 文本又被 LLM
+        当成自然语言查询，工具再跑一次，用户就收到两份结果。
+        """
         data = hikari_data.Output.Data
         if isinstance(data, bytes):
-            task = asyncio.create_task(
-                self._save_and_send_image(event, hikari_data, data)
-            )
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            await self._save_and_send_image(event, hikari_data, data)
         elif isinstance(data, str):
             await reply_text(event, data)
         else:

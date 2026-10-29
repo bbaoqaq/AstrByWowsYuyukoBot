@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import gc
 import hashlib
 import io
@@ -6,6 +7,7 @@ import json
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,8 @@ class BrowserRenderError(RuntimeError):
 class minimal_screens_hot_service:
     _instance = None
     _initialized = False
+    # 进程内已体检过系统库的内核路径，避免每次查询都跑一遍 ldd
+    _deps_checked: set = set()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -96,7 +100,10 @@ class minimal_screens_hot_service:
             self.playwright = None
 
     async def chromium(self):
-        browser_path = minimal_screens_hot_service.setup_playwright(browser="chromium")
+        # 安装/体检可能耗时数分钟（下载内核、apt 装库），丢线程里跑，别卡事件循环
+        browser_path = await asyncio.to_thread(
+            minimal_screens_hot_service.setup_playwright, browser="chromium"
+        )
         if not browser_path:
             logger.error("未找到可用的 chromium 内核（Playwright 安装失败），跳过启动")
             return False
@@ -156,7 +163,9 @@ class minimal_screens_hot_service:
     async def firefox(self):
         start_time = time.time()
         # 使用最小的启动参数
-        browser_path = minimal_screens_hot_service.setup_playwright(browser="firefox")
+        browser_path = await asyncio.to_thread(
+            minimal_screens_hot_service.setup_playwright, browser="firefox"
+        )
         if not browser_path:
             logger.error("未找到可用的 firefox 内核（Playwright 安装失败），跳过启动")
             return False
@@ -785,26 +794,184 @@ class minimal_screens_hot_service:
         return ''
 
     @staticmethod
-    def _run_playwright_install(browser: str):
-        """用 Playwright 自带的 node driver 安装浏览器内核。
+    def _install_env() -> dict:
+        """构造 Playwright 安装用的环境变量，只作用于子进程。
+
+        ▍为什么不写 os.environ：插件只是 AstrBot 的一个插件，不该改动宿主进程
+          （更不该改动容器）的环境变量。这里每次都新建一份 env 传给 subprocess，
+          装完即失效，AstrBot 其他插件和后续逻辑不受影响。
         """
         env = dict(os.environ)
         try:
-            from playwright._impl._driver import (
-                compute_driver_executable,
-                get_driver_env,
-            )
+            from playwright._impl._driver import get_driver_env
+
+            env.update(get_driver_env())
+        except Exception as e:
+            logger.debug(f"获取 Playwright driver 环境失败，使用当前进程环境: {e}")
+        env["PLAYWRIGHT_BROWSERS_PATH"] = str(get_cache_file() / "browsers")
+        env["PLAYWRIGHT_DOWNLOAD_HOST"] = "https://npmmirror.com/mirrors/playwright/"
+        return env
+
+    @staticmethod
+    def _run_playwright_driver(args: List[str], timeout: int = 600):
+        """调用 Playwright 自带 node driver 执行子命令（install / install-deps）。
+
+        Args:
+            args: 传给 driver 的参数，例如 ["install", "chromium"]
+            timeout: 子进程超时秒数，apt 安装可能较慢，默认给足 10 分钟
+        """
+        env = minimal_screens_hot_service._install_env()
+        try:
+            from playwright._impl._driver import compute_driver_executable
 
             node, cli = compute_driver_executable()
-            env.update(get_driver_env())
-            cmd = [node, cli, "install", browser]
+            cmd = [node, cli, *args]
         except Exception as e:
             logger.warning(f"获取 Playwright driver 失败（{e}），回退到 python -m playwright")
             env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
-            cmd = [sys.executable, "-m", "playwright", "install", browser]
-        env["PLAYWRIGHT_BROWSERS_PATH"] = str(get_cache_file() / "browsers")
-        env["PLAYWRIGHT_DOWNLOAD_HOST"] = "https://npmmirror.com/mirrors/playwright/"
-        return subprocess.run(cmd, capture_output=True, text=True, env=env)
+            cmd = [sys.executable, "-m", "playwright", *args]
+
+        # 独立进程组：超时时整组回收，避免 apt/node 子进程残留占住 dpkg 锁
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                proc.kill()
+            try:
+                stdout, stderr = proc.communicate(timeout=30)
+            except Exception:
+                stdout, stderr = "", ""
+            raise subprocess.TimeoutExpired(
+                cmd, timeout, output=stdout, stderr=stderr
+            )
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+    @staticmethod
+    def _run_playwright_install(browser: str):
+        """用 Playwright 自带的 node driver 安装浏览器内核。"""
+        return minimal_screens_hot_service._run_playwright_driver(["install", browser])
+
+    @staticmethod
+    def _missing_shared_libs(executable: str) -> List[str]:
+        """用 ldd 探测浏览器内核缺失的系统库（仅 Linux）。
+
+        ▍为什么需要它：Playwright 只负责下载内核，内核运行时依赖的 libnss3 /
+          libatk / libatspi 等由发行版提供。容器里这些库通常没有，于是出现
+          「浏览器启动失败」，而日志里看不出真正原因。
+        """
+        if sys.platform != "linux" or not executable:
+            return []
+        try:
+            result = subprocess.run(
+                ["ldd", executable], capture_output=True, text=True, timeout=30
+            )
+        except Exception as e:
+            logger.debug(f"ldd 检测失败，跳过依赖体检: {e}")
+            return []
+        missing: List[str] = []
+        for line in (result.stdout or "").splitlines():
+            if "not found" not in line:
+                continue
+            name = line.strip().split(" ")[0]
+            if name:
+                missing.append(name)
+        return missing
+
+    @staticmethod
+    def _ensure_system_deps(executable: str) -> bool:
+        """检查内核缺失的系统库，缺了就用 playwright install-deps 补齐。
+
+        Returns:
+            bool: True 表示依赖就绪（或当前平台无需检查），False 表示仍缺库。
+        """
+        if executable in minimal_screens_hot_service._deps_checked:
+            return True
+
+        missing = minimal_screens_hot_service._missing_shared_libs(executable)
+        if not missing:
+            minimal_screens_hot_service._deps_checked.add(executable)
+            return True
+
+        logger.warning(f"浏览器内核缺少系统库: {', '.join(missing)}")
+        if sys.platform != "linux":
+            logger.error("非 Linux 平台无法自动安装系统依赖，请手动补装浏览器运行库")
+            return False
+
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            logger.error(
+                "当前进程不是 root，无法自动安装系统依赖；"
+                "请用 root 运行，或在镜像构建阶段加上：RUN playwright install-deps chromium"
+            )
+            return False
+
+        logger.info("正在安装 Playwright 系统依赖，首次可能需要数分钟（网络慢时会更久）...")
+        try:
+            result = minimal_screens_hot_service._run_playwright_driver(
+                ["install-deps"], timeout=1800
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "安装系统依赖超时（30 分钟），请检查网络或在构建镜像时预装："
+                "RUN playwright install-deps chromium"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"安装系统依赖失败: {e}")
+            return False
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[:500]
+            logger.error(f"系统依赖安装失败（exit {result.returncode}）: {detail}")
+            logger.error(
+                "可在镜像构建阶段预装依赖（RUN playwright install-deps chromium），"
+                "或把 use_broswer 改成 firefox 再试"
+            )
+            return False
+
+        still_missing = minimal_screens_hot_service._missing_shared_libs(executable)
+        if still_missing:
+            logger.error(f"系统依赖安装后仍缺少: {', '.join(still_missing)}")
+            return False
+        logger.info("系统依赖安装完成")
+        minimal_screens_hot_service._deps_checked.add(executable)
+        return True
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _install_lock(browsers_path: Path):
+        """安装互斥锁，避免多个请求同时触发下载/装依赖。
+
+        拿不到 fcntl 的平台（如 Windows）退化为不加锁，行为与旧版一致。
+        """
+        lock_file = open(browsers_path / ".install.lock", "w")
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                locked = True
+            except Exception:
+                locked = False
+            yield locked
+        finally:
+            if locked:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            lock_file.close()
 
     @staticmethod
     def setup_playwright(browser: str = "chromium") -> str:
@@ -825,6 +992,9 @@ class minimal_screens_hot_service:
             if marker_ok:
                 executable = minimal_screens_hot_service.find_executable(browser, browsers_path)
                 if executable:
+                    # 内核走持久目录，但系统库装在容器层，重启会丢，
+                    # 所以每次启动都要体检一次（进程内只查一次，靠 _deps_checked 去重）
+                    minimal_screens_hot_service._ensure_system_deps(executable)
                     return executable
                 logger.info(f"缓存标记存在但内核缺失（{browsers_path}），重新安装 {browser}")
             else:
@@ -833,54 +1003,61 @@ class minimal_screens_hot_service:
                     f"将重新安装 {browser}"
                 )
 
-        # 3. 安装到插件缓存目录
-        os.environ['PLAYWRIGHT_DOWNLOAD_HOST'] = 'https://npmmirror.com/mirrors/playwright/'
-        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(browsers_path)
+        # 3. 安装到插件缓存目录；环境变量只传给子进程，不改动宿主进程与容器
         logger.info(f"🎯 Playwright 浏览器将安装到: {browsers_path}")
 
-        # 4. 安装系统依赖（只有 Linux 需要）
-        if sys.platform != "win32":
-            logger.info("正在安装系统依赖...")
+        with minimal_screens_hot_service._install_lock(browsers_path):
+            # 锁内复查：并发请求可能刚把内核装好
+            executable = minimal_screens_hot_service.find_executable(browser, browsers_path)
+            if executable and env_file.exists():
+                return executable
+
+            # 4. 安装浏览器内核
+            logger.info(f"正在安装 {browser}...")
             try:
-                from playwright._impl._driver import (
-                    compute_driver_executable,
-                    get_driver_env,
+                result = minimal_screens_hot_service._run_playwright_install(browser)
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    f"❌ {browser} 内核下载超时（10 分钟），"
+                    "请检查网络连通性或稍后重试"
+                )
+                return None
+            except Exception as e:
+                logger.error(f"❌ 调用 Playwright 安装器失败: {e}")
+                return None
+
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()[:500]
+                logger.error(f"❌ {browser} 安装失败（exit {result.returncode}）: {detail}")
+                try:
+                    env_file.unlink()
+                except OSError:
+                    pass
+                return None
+
+            # 5. 验证安装
+            executable = minimal_screens_hot_service.find_executable(browser, browsers_path)
+            if not executable:
+                logger.error(f"❌ {browser} 安装后仍未找到可执行文件: {browsers_path}")
+                try:
+                    env_file.unlink()
+                except OSError:
+                    pass
+                return None
+
+            # 6. 系统运行库体检：缺库才装依赖，装不上只警告不阻断
+            if not minimal_screens_hot_service._ensure_system_deps(executable):
+                logger.warning(
+                    "系统运行库未就绪，浏览器很可能启动失败；"
+                    "建议在镜像构建阶段执行 playwright install-deps"
                 )
 
-                node, cli = compute_driver_executable()
-                env = get_driver_env()
-                env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_path)
-                subprocess.run([node, cli, "install-deps"], check=False, env=env)
-            except Exception as e:
-                logger.debug(f"跳过 install-deps: {e}")
-
-        # 5. 安装浏览器
-        logger.info(f"正在安装 {browser}...")
-        result = minimal_screens_hot_service._run_playwright_install(browser)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()[:500]
-            logger.error(f"❌ {browser} 安装失败（exit {result.returncode}）: {detail}")
-            try:
-                env_file.unlink()
-            except OSError:
-                pass
-            return None
-
-        # 6. 验证安装
-        executable = minimal_screens_hot_service.find_executable(browser, browsers_path)
-        if not executable:
-            logger.error(f"❌ {browser} 安装后仍未找到可执行文件: {browsers_path}")
-            try:
-                env_file.unlink()
-            except OSError:
-                pass
-            return None
-
-        with open(env_file, 'w', encoding='utf-8') as f:
-            f.write(f"PLAYWRIGHT_BROWSERS_PATH={browsers_path}\n")
-            f.write(f"REVISION={expected_revision}\n")
-        logger.info(f"✅ {browser} 安装完成: {executable}")
-        return executable
+            # 7. 标记只在确有可执行文件时写，避免一次失败后永不重试
+            with open(env_file, 'w', encoding='utf-8') as f:
+                f.write(f"PLAYWRIGHT_BROWSERS_PATH={browsers_path}\n")
+                f.write(f"REVISION={expected_revision}\n")
+            logger.info(f"✅ {browser} 安装完成: {executable}")
+            return executable
 
     @staticmethod
     def find_executable(browser_type: str = "chromium", browser_path: Path = None):
@@ -891,15 +1068,25 @@ class minimal_screens_hot_service:
                 patterns = json.loads(config_file.read_text())
             else:
                 patterns = {
+                    # 列表顺序即优先级：优先完整内核，找不到再退回 headless shell
                     'chromium': {
-                        'windows': 'chromium-*/chrome-win*/chrome.exe',
-                        'linux': 'chromium-*/chrome-linux*/chrome',
-                        'darwin': 'chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium'
+                        'windows': [
+                            'chromium-*/chrome-win*/chrome.exe',
+                            'chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe',
+                        ],
+                        'linux': [
+                            'chromium-*/chrome-linux*/chrome',
+                            'chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell',
+                        ],
+                        'darwin': [
+                            'chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium',
+                            'chromium_headless_shell-*/chrome-headless-shell-mac*/chrome-headless-shell',
+                        ],
                     },
                     'firefox': {
-                        'windows': 'firefox-*/firefox*/firefox.exe',
-                        'linux': 'firefox-*/firefox*/firefox',
-                        'darwin': 'firefox-*/firefox*/Firefox.app/Contents/MacOS/firefox'
+                        'windows': ['firefox-*/firefox*/firefox.exe'],
+                        'linux': ['firefox-*/firefox*/firefox'],
+                        'darwin': ['firefox-*/firefox*/Firefox.app/Contents/MacOS/firefox'],
                     }
                 }
                 with open(config_file, 'w', encoding='utf-8') as f:
@@ -907,11 +1094,16 @@ class minimal_screens_hot_service:
 
             pattern = patterns.get(browser_type, {}).get(system)
             if pattern:
-                matches = list(browser_path.glob(pattern))
-                if matches:
+                # 兼容旧版本落盘的字符串模式
+                candidates = pattern if isinstance(pattern, list) else [pattern]
+                for candidate in candidates:
+                    matches = list(browser_path.glob(candidate))
+                    if not matches:
+                        continue
+
                     # 多版本缓存共存时取构建号最大的（升级 playwright 后避免仍命中旧内核）
                     def _build_revision(p: Path) -> int:
-                        m = re.search(rf'{re.escape(browser_type)}-(\d+)', str(p))
+                        m = re.search(rf'{re.escape(browser_type)}[_-]?(\d+)', str(p))
                         return int(m.group(1)) if m else 0
                     matches.sort(key=_build_revision, reverse=True)
                     return str(matches[0])

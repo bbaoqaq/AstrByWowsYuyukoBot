@@ -1,7 +1,7 @@
 """战舰世界战绩查询插件（AstrBot 接入层 / 唯一入口）。
 
 AstrBot 通过 `main.py` 发现插件：它按 `data.plugins.<插件目录>.main` 这个模块路径
-去匹配处理器，所以**带 `@filter.xxx` 和 `@llm_tool` 装饰的方法必须留在本文件**，
+去匹配处理器，所以**带 `@filter.xxx` 和 `@filter.llm_tool` 装饰的方法必须留在本文件**，
 否则会因为模块路径对不上而不被发现（见 `astrbot/core/star/star_manager.py`：
 `ft.handler.__module__ == metadata.module_path` 才会绑定 Star 实例）。
 
@@ -19,11 +19,19 @@ import functools
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
-# llm_tool：把一个 async 函数注册成 LLM 可调用的工具（function-calling）。
-# 它从 astrbot.api 顶层导出；工具的参数 schema 由函数 docstring 的 Args: 段生成。
-from astrbot.api import llm_tool
 
-from astrbot.core.star.filter.command import GreedyStr
+# LLM 工具（function-calling）用 `@filter.llm_tool(...)` 注册：这是现行文档
+# （docs.astrbot.app/dev/star/guides/ai.html）给出的写法，和旧版
+# `from astrbot.api import llm_tool` 是同一个注册函数。工具的参数 schema 由函数
+# docstring 的 description（首段）与 Args: 段生成，所以描述必须写在 docstring 里。
+#
+# GreedyStr：标记「吃掉指令名之后的所有剩余文本」的参数类型。它定义在指令过滤器
+# 模块里（见 astrbot/core/star/filter/command.py），没有从 astrbot.api.event 导出；
+# 这里做一次兼容导入，免得将来位置变动直接 ImportError。
+try:
+    from astrbot.core.star.filter.command import GreedyStr
+except ImportError:  # pragma: no cover - 仅在未来版本搬家时走到
+    from astrbot.api.event import GreedyStr  # type: ignore[attr-defined]
 
 from .yuyuko_bot import (
     CoreRuntime,
@@ -52,9 +60,12 @@ from .yuyuko_llm import (  # noqa: E402
 
 COMMAND = "wws"
 # AstrBot 平台适配器 -> hikari 的 platform 取值
+# qq_official 与 qq_official_webhook 是 AstrBot 里两个独立适配器（WebSocket / Webhook），
+# 同属 QQ 官方机器人，hikari 侧取值一样。
 PLATFORM_MAP = {
     "aiocqhttp": "QQ",
     "qq_official": "QQ_OFFICIAL",
+    "qq_official_webhook": "QQ_OFFICIAL",
 }
 
 # 近期查询的天数上限（防止模型填 99999 把上游拖死）
@@ -108,19 +119,24 @@ def _clamp_days(days: int | None) -> int | None:
 
 
 class WowsYuyuko(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
+        """AstrBot 实例化插件时会传入 `_conf_schema.json` 生成的配置对象。
+
+        `config` 给了默认值：没有 `_conf_schema.json`（或被手动实例化）时也能构造，
+        后面统一按「空配置」处理，不会因为 None 去调用 `.get()` 而炸掉。
+        """
         super().__init__(context)
-        self.config = config
-        self.runtime = CoreRuntime(config)
+        self.config: AstrBotConfig | dict = config if config is not None else {}
+        self.runtime = CoreRuntime(self.config)
         self.selection = SelectionManager()
         self.sender = OutputSender()
-        self.guard = ToolGuard(config)
+        self.guard = ToolGuard(self.config)
         self.tools = ToolExecutor(
             runtime=self.runtime,
             sender=self.sender,
             guard=self.guard,
             platform_for=_platform_of,
-            config=config,
+            config=self.config,
         )
 
     async def initialize(self):
@@ -189,6 +205,9 @@ class WowsYuyuko(Star):
             except Exception as e:
                 logger.exception(f"指令处理异常 {e}")
                 await reply_text(event, "呜呜呜发生了错误，可能是网络问题，如果过段时间不能恢复请联系麻麻哦~")
+            finally:
+                # 指令已经给出结果，别让这条消息继续流进 LLM 阶段被再查一遍
+                event.stop_event()
 
     @filter.regex(r"^\d+$")
     async def change_select_state(self, event: AstrMessageEvent):
@@ -211,10 +230,17 @@ class WowsYuyuko(Star):
     # =======================================================================
     # LLM 工具（function-calling）
     #
-    # ▍为什么每个方法都要写一遍参数
-    # @llm_tool 用 docstring 生成 JSON Schema（astrbot/core/star/register/star_handler.py
-    # 的 register_llm_tool 解析 `Args:` 段），schema 就是模型看到的全部信息，
+    # ▍注册方式
+    # `@filter.llm_tool(name=...)`（等价于旧写法 `from astrbot.api import llm_tool`
+    # 后 `@llm_tool(...)`，见 docs.astrbot.app/dev/star/guides/ai.html）。
+    # 参数 schema 由 docstring 的首段（description）与 `Args:` 段生成，
+    # 见 astrbot/core/star/register/star_handler.py 的 register_llm_tool，
     # 所以参数必须显式声明 —— 帮不了它做动态生成。
+    #
+    # ▍为什么装饰器必须留在 main.py
+    # AstrBot 用 `工具.handler.__module__ == 插件模块路径` 判断工具归属
+    # （astrbot/core/star/star_manager.py），只有本文件的模块路径等于插件模块路径，
+    # 工具才能拿到 `self` 这个 Star 实例。
     #
     # ▍返回值约定
     # 返回 str 会进入下一轮 LLM 上下文（模型据此作答/点评）；
@@ -227,7 +253,7 @@ class WowsYuyuko(Star):
     # nickname（游戏昵称），两者都留空 = 查当前用户自己（用 TA 绑定的账号）。
     # =======================================================================
 
-    @llm_tool(name="wws_account")
+    @filter.llm_tool(name="wws_account")
     @tool_guard
     async def wws_account(
         self,
@@ -251,7 +277,7 @@ class WowsYuyuko(Star):
             inject_identity=not nickname,
         )
 
-    @llm_tool(name="wws_ship")
+    @filter.llm_tool(name="wws_ship")
     @tool_guard
     async def wws_ship(
         self,
@@ -276,7 +302,7 @@ class WowsYuyuko(Star):
             inject_identity=not nickname,
         )
 
-    @llm_tool(name="wws_recent")
+    @filter.llm_tool(name="wws_recent")
     @tool_guard
     async def wws_recent(
         self,
@@ -307,7 +333,7 @@ class WowsYuyuko(Star):
             inject_identity=not nickname,
         )
 
-    @llm_tool(name="wws_recent_random")
+    @filter.llm_tool(name="wws_recent_random")
     @tool_guard
     async def wws_recent_random(
         self,
@@ -334,7 +360,7 @@ class WowsYuyuko(Star):
             event, command, "recent", "wws_recent_random", inject_identity=not nickname
         )
 
-    @llm_tool(name="wws_recent_rank")
+    @filter.llm_tool(name="wws_recent_rank")
     @tool_guard
     async def wws_recent_rank(
         self,
@@ -360,7 +386,7 @@ class WowsYuyuko(Star):
             event, command, "recent", "wws_recent_rank", inject_identity=not nickname
         )
 
-    @llm_tool(name="wws_ship_recent")
+    @filter.llm_tool(name="wws_ship_recent")
     @tool_guard
     async def wws_ship_recent(
         self,
@@ -387,7 +413,7 @@ class WowsYuyuko(Star):
             event, command, "recent", "wws_ship_recent", inject_identity=not nickname
         )
 
-    @llm_tool(name="wws_recent_battles")
+    @filter.llm_tool(name="wws_recent_battles")
     @tool_guard
     async def wws_recent_battles(
         self,
@@ -410,7 +436,7 @@ class WowsYuyuko(Star):
             "wws_recent_battles", inject_identity=not nickname,
         )
 
-    @llm_tool(name="wws_ships")
+    @filter.llm_tool(name="wws_ships")
     @tool_guard
     async def wws_ships(
         self,
@@ -446,7 +472,7 @@ class WowsYuyuko(Star):
             inject_identity=not nickname,
         )
 
-    @llm_tool(name="wws_roll_ship")
+    @filter.llm_tool(name="wws_roll_ship")
     @tool_guard
     async def wws_roll_ship(
         self,
@@ -469,7 +495,7 @@ class WowsYuyuko(Star):
             event, build_roll_command(nation, ship_type, level), "roll", "wws_roll_ship"
         )
 
-    @llm_tool(name="wws_bind")
+    @filter.llm_tool(name="wws_bind")
     @tool_guard
     async def wws_bind(
         self,
@@ -493,7 +519,7 @@ class WowsYuyuko(Star):
             event, build_bind_command(server, nickname), "bind", "wws_bind"
         )
 
-    @llm_tool(name="wws_bind_list")
+    @filter.llm_tool(name="wws_bind_list")
     @tool_guard
     async def wws_bind_list(self, event: AstrMessageEvent) -> str:
         """查询当前用户已经绑定了哪些游戏账号。
@@ -504,7 +530,7 @@ class WowsYuyuko(Star):
             event, COMMAND_BUILDERS["bind_list"], "bind", "wws_bind_list"
         )
 
-    @llm_tool(name="wws_bind_change")
+    @filter.llm_tool(name="wws_bind_change")
     @tool_guard
     async def wws_bind_change(
         self,
